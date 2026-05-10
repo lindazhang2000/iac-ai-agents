@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+.terraform/
+*.tfstate
+*.tfstate.backup
+.foundry/results/
+.foundry/datasets/
+generated_terraform/
