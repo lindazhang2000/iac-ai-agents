@@ -1,0 +1,136 @@
+name: terraform-apply
+
+# Triggered when a PR opened by SnowIaC is merged into main.
+# Runs `terraform apply` on the changed ticket directory, then calls back
+# into the SnowIaC server's /webhooks/github endpoint with the deployment
+# report (including real Terraform outputs).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'snowflake/**'
+      - 'azure/**'
+
+permissions:
+  id-token: write    # OIDC for `azure/login`
+  contents: read
+
+env:
+  # Azurerm backend config — values come from repo variables/secrets.
+  TFSTATE_RG: ${{ vars.TFSTATE_RESOURCE_GROUP }}
+  TFSTATE_SA: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+  TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect ticket + working directory
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          msg=$(git log -1 --pretty=%B)
+          ticket=$(echo "$msg" | grep -oE 'RITM[0-9]+' | head -n1 || true)
+
+          # Find the first changed file under azure/ or snowflake/ and use its
+          # immediate ticket subdirectory (e.g. azure/ritm0654928/main.tf -> azure/ritm0654928).
+          changed=$(git diff --name-only HEAD~1 HEAD | grep -E '^(azure|snowflake)/' | head -n1 || true)
+          if [ -z "$changed" ]; then
+            echo "::error::No azure/ or snowflake/ files changed in this commit"; exit 1
+          fi
+          # Take the top two path components: e.g. azure/ritm0654928
+          dir=$(echo "$changed" | awk -F/ '{print $1"/"$2}')
+          if [ -z "$ticket" ]; then
+            ticket=$(basename "$dir" | tr '[:lower:]' '[:upper:]')
+          fi
+          echo "ticket=$ticket" >> "$GITHUB_OUTPUT"
+          echo "dir=$dir"       >> "$GITHUB_OUTPUT"
+          echo "Ticket: $ticket  Dir: $dir"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Terraform init
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${TFSTATE_RG}" \
+            -backend-config="storage_account_name=${TFSTATE_SA}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=${{ steps.meta.outputs.ticket }}.tfstate"
+
+      - name: Terraform plan
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform apply
+        id: tf
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: |
+          terraform apply -input=false -auto-approve tfplan
+          terraform output -json > outputs.json
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-${{ steps.meta.outputs.ticket }}
+          path: |
+            ${{ steps.meta.outputs.dir }}/tfplan
+            ${{ steps.meta.outputs.dir }}/outputs.json
+          if-no-files-found: ignore
+
+      - name: Notify SnowIaC (success)
+        if: success()
+        env:
+          WEBHOOK_URL: ${{ secrets.SNOWIAC_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.SNOWIAC_WEBHOOK_SECRET }}
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: |
+          outputs=$(cat outputs.json 2>/dev/null || echo '{}')
+          payload=$(jq -n \
+            --arg t "${{ steps.meta.outputs.ticket }}" \
+            --arg r "${{ github.run_id }}" \
+            --arg u "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson o "$outputs" \
+            '{ticket_id:$t,status:"applied",run_id:$r,log_url:$u,outputs:$o}')
+          sig=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $2}')
+          curl -fsS -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Snowiac-Signature: sha256=$sig" \
+            --data "$payload"
+
+      - name: Notify SnowIaC (failure)
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ secrets.SNOWIAC_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.SNOWIAC_WEBHOOK_SECRET }}
+        run: |
+          payload=$(jq -n \
+            --arg t "${{ steps.meta.outputs.ticket }}" \
+            --arg r "${{ github.run_id }}" \
+            --arg u "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{ticket_id:$t,status:"failed",run_id:$r,log_url:$u,outputs:{}}')
+          sig=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $2}')
+          curl -fsS -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Snowiac-Signature: sha256=$sig" \
+            --data "$payload"
