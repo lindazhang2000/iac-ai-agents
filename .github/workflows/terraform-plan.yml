@@ -1,0 +1,121 @@
+name: terraform-plan-policy
+
+# Hermetic policy-as-code gate. Runs on every pull request that touches
+# azure/**. It is intentionally self-contained: NO Azure credentials and NO
+# remote state are required, so it is safe to run in the fork/PR context and
+# cannot leak cloud access. It analyses the proposed Terraform statically:
+#   * terraform fmt   — formatting
+#   * terraform validate (-backend=false) — syntactic/schema validity
+#   * Conftest        — SnowIaC-specific guardrails (policy/snowiac.rego),
+#                        the authoritative blocking gate.
+#   * Checkov         — broad off-the-shelf IaC scan (report-only).
+# A Conftest failure blocks the merge, making the human-merge step a real
+# policy-enforcement boundary.
+#
+# Make this a *required* status check on the `main` branch protection rule so
+# it cannot be bypassed.
+
+on:
+  # Runs on EVERY pull request to main (no path filter) so the required
+  # `policy-gate` status check is always reported. The job short-circuits and
+  # passes immediately when the PR changes no azure/** Terraform, so non-infra
+  # PRs are not blocked waiting for a check that never runs.
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write # to post the gate summary as a PR comment
+
+jobs:
+  policy-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed ticket directory
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed=$(git diff --name-only "$base" "$head" | grep -E '^azure/' | head -n1 || true)
+          if [ -z "$changed" ]; then
+            echo "::notice::No azure/ files changed; skipping policy gate."
+            echo "dir=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dir=$(echo "$changed" | awk -F/ '{print $1"/"$2}')
+          ticket=$(basename "$dir" | tr '[:lower:]' '[:upper:]')
+          echo "dir=$dir"       >> "$GITHUB_OUTPUT"
+          echo "ticket=$ticket" >> "$GITHUB_OUTPUT"
+          echo "Dir: $dir  Ticket: $ticket"
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.meta.outputs.dir != ''
+        with:
+          terraform_version: 1.9.5
+
+      - name: Terraform fmt check
+        if: steps.meta.outputs.dir != ''
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: terraform fmt -check -diff
+
+      - name: Terraform validate (no backend)
+        if: steps.meta.outputs.dir != ''
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: |
+          terraform init -input=false -backend=false
+          terraform validate
+
+      - name: Setup Conftest
+        if: steps.meta.outputs.dir != ''
+        run: |
+          CONFTEST_VERSION=0.56.0
+          curl -sSfL \
+            "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            -o /tmp/conftest.tar.gz
+          tar -xzf /tmp/conftest.tar.gz -C /tmp conftest
+          sudo install /tmp/conftest /usr/local/bin/conftest
+          conftest --version
+
+      - name: Conftest (SnowIaC guardrails — blocking)
+        if: steps.meta.outputs.dir != ''
+        run: |
+          conftest test "${{ steps.meta.outputs.dir }}" \
+            --parser hcl2 \
+            --policy policy \
+            --no-color
+
+      - name: Checkov (broad IaC scan — report only)
+        if: steps.meta.outputs.dir != ''
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ steps.meta.outputs.dir }}
+          framework: terraform
+          soft_fail: true
+          output_format: cli
+
+      - name: Post gate summary
+        if: always() && steps.meta.outputs.dir != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const dir = '${{ steps.meta.outputs.dir }}';
+            let body = `### Terraform policy gate for \`${dir}\`\n\n`;
+            body += `Status: **${{ job.status }}**\n\n`;
+            body += `Hermetic static analysis (no cloud credentials):\n`;
+            body += `- \`terraform fmt\` + \`terraform validate -backend=false\`\n`;
+            body += `- **Conftest** (\`policy/snowiac.rego\`) — blocking guardrails\n`;
+            body += `- Checkov — broad IaC scan (report-only)\n\n`;
+            body += `A failing Conftest check blocks this merge.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
