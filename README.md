@@ -1,6 +1,6 @@
 # IaC AI Agents
 
-> A multi-agent system that takes a ServiceNow request, generates Terraform, opens a pull request, lets a human approve, deploys to Azure via GitHub Actions OIDC, verifies the live infrastructure against a spec, and auto-closes the ticket.
+> A multi-agent system that takes a ServiceNow request or other systems, generates Terraform, opens a pull request, lets a human approve, deploys to Azure via GitHub Actions OIDC, verifies the live infrastructure against a spec, and auto-closes the ticket.
 
 Built with **Microsoft Agent Framework** and **Microsoft Foundry** (`gpt-5.4`), FastAPI, Terraform, and a PostgreSQL ticket store (SQLite is supported for local dev).
 
